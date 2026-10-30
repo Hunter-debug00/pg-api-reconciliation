@@ -1,0 +1,15 @@
+{
+  "name": "Project 2: PG Reconciliation Benchmark",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/pg-api-reconciliation",
+  "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && ~/.local/bin/uv sync --locked",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ckolkman.vscode-postgres"
+      ]
+    }
+  }
+}
