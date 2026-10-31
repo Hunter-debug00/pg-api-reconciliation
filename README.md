@@ -1,262 +1,131 @@
-# PostgreSQL API Reconciliation: Concurrency, Mutations & Anti-Joins
+# Can You Safely Delete Rows from a Mutable API?
 
-A benchmark comparing seven strategies for purging hard-deleted rows from PostgreSQL without dropping active records during concurrent API mutations.
+Seven PostgreSQL reconciliation strategies tested against a changing paginated source.
 
----
+[![CI](https://github.com/Hunter-debug00/pg-api-reconciliation/actions/workflows/ci.yml/badge.svg)](https://github.com/Hunter-debug00/pg-api-reconciliation/actions/workflows/ci.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
+![PostgreSQL 16](https://img.shields.io/badge/postgresql-16-blue)
+![License MIT](https://img.shields.io/badge/license-MIT-green)
 
-## Overview
+You sync subscriptions from a SaaS API into PostgreSQL. A customer is hard-deleted upstream, and your copy keeps them forever. So you scan the API, collect every ID you see, and delete the rest.
 
-When downstream databases sync records from third-party SaaS APIs (such as Stripe, Shopify, HubSpot, or internal microservices), mutations generally arrive via incremental endpoints:
+Then the scan misses an active customer, and you delete them too.
 
-```text
-GET /subscriptions?updated_after=2026-01-01T12:00:00Z
-```
+This repo reproduces that failure on purpose and compares seven ways of deciding a row is really gone. A FastAPI simulator plays the upstream API, PostgreSQL 16 holds the copy, and the data is 10,000 subscriptions across two tenants. Mutations hit the source while the scan is running, the same way every time. 32 tests, 20 repeated timing trials per strategy.
 
-These changes are upserted into PostgreSQL using `INSERT ... ON CONFLICT (tenant_id, id) DO UPDATE`.
+## The problem
 
-This works reliably until the upstream system **hard-deletes** a record instead of publishing a soft-delete tombstone (`is_deleted = true`). Because hard-deleted records no longer exist at the source, they never appear in incremental cursor queries. Downstream in PostgreSQL, those records remain permanently as **ghost rows**.
+Incremental sync (`GET /subscriptions?updated_after=...`) catches new rows, edits and soft deletes. It cannot catch a hard delete, because a deleted row has no `updated_at` to report. The row stays in PostgreSQL as a ghost and keeps counting toward your MRR.
 
-In billing systems, ghost rows quietly corrupt financial aggregates, artificially inflating Monthly Recurring Revenue (MRR) and skewing subscription metrics.
-
-To eliminate ghost rows, teams often implement periodic full reconciliation sweeps:
-1. Paginate through all active upstream records.
-2. Collect the set of returned IDs.
-3. Delete local records absent from the scan:
-   ```sql
-   DELETE FROM destination_subscriptions
-   WHERE tenant_id = 'acme'
-     AND id NOT IN (seen_ids);
-   ```
-
-Under concurrent traffic, this naive anti-join introduces a failure mode far worse than ghost rows: **valid, active customer records are skipped during pagination and falsely deleted from PostgreSQL.**
-
-This repository models, reproduces, and benchmarks seven reconciliation strategies under deterministic concurrent mutations, quantifying correctness, concurrency barriers, and PostgreSQL execution costs.
-
----
-
-## Core Failure Modes
-
-### 1. OFFSET Boundary Slip
-
-When an API paginates using `OFFSET` and `LIMIT`, any deletion occurring ahead of the pagination cursor shifts subsequent records backward by one index position.
-
-```text
-Page 1 Fetch (OFFSET 0, LIMIT 100):
-  [ ID 10 ... ID 420 ... ID 1000 ]   (Client receives IDs 10..1000)
-                 |
-      ID 420 hard-deleted at source before Page 2 request
-                 v
-Source index shifts left by 1:
-  Index 98: ID 1000
-  Index 99: ID 1010  (Slips from index 100 to index 99, inside Page 1 range)
-  Index 100: ID 1020 (Page 2 OFFSET 100, LIMIT 100 starts here)
-
-Result:
-  ID 1010 was never returned on Page 1 or Page 2.
-  Anti-join deletes ID 1010 from PostgreSQL despite remaining active at source.
-```
-
-Switching to monotonic keyset pagination (`WHERE id > cursor LIMIT 100`) solves positional drift, but keyset pagination alone does not protect against concurrent writes.
-
----
-
-### 2. The Non-Transactional Sequence Race
-
-To prevent deleting records created *while* the reconciler is paginating, systems often capture a high-water mark (HWM) before scanning starts:
-- Timestamp watermark: `DELETE WHERE source_created_at < sweep_start_time`
-- Monotonic sequence watermark: `DELETE WHERE ingestion_seq <= hwm_seq`
-
-With high-concurrency ingestion writers, sequence allocation is non-transactional. PostgreSQL `nextval()` advances immediately outside the transaction boundary:
-
-```text
-Ingestion Tx A:   BEGIN
-Ingestion Tx A:   nextval('dest_ingestion_seq') -> allocates 10001 for ID 485 (uncommitted)
-
-Reconciler B:     Captures sequence HWM = 10001
-Reconciler B:     Paginates past ID 485 (ID 485 not yet committed or visible)
-
-Ingestion Tx A:   COMMIT (ID 485 committed with ingestion_seq = 10001 <= HWM)
-
-Reconciler B:     DELETE WHERE ingestion_seq <= 10001
-                  -> Deletes active ID 485 because 10001 <= HWM!
-```
-
----
-
-### 3. The Transactional Epoch Barrier Solution
-
-To close this race window without table-level write locks, we implement a database-enforced epoch barrier using PostgreSQL row locks on a lightweight `tenant_watermarks` table.
-
-Every ingestion write automatically acquires a `FOR SHARE` lock on its tenant's watermark row via a `BEFORE INSERT OR UPDATE` trigger:
+The usual fix is a full sweep:
 
 ```sql
-CREATE OR REPLACE FUNCTION enforce_tenant_epoch_and_quarantine()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_epoch BIGINT;
-BEGIN
-    SELECT current_epoch INTO v_epoch
-    FROM tenant_watermarks
-    WHERE tenant_id = NEW.tenant_id
-    FOR SHARE;
-
-    NEW.ingestion_epoch := v_epoch;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-```
-
-When a reconciliation sweep starts, it executes:
-
-```sql
-UPDATE tenant_watermarks
-SET current_epoch = current_epoch + 1
+DELETE FROM destination_subscriptions
 WHERE tenant_id = 'acme'
-RETURNING current_epoch - 1;
+  AND id NOT IN (/* every ID the scan returned */);
 ```
 
-This `UPDATE` requests an exclusive row lock on the watermark row. PostgreSQL holds the update until all active writers in the current epoch have committed. Once unblocked, the prior epoch is sealed. All subsequent writes automatically stamp into the new epoch.
+That statement trusts the scan completely. A scan over a source that is changing under it can be wrong in four ways, and each one is a test in this repo.
 
-The reconciler then scopes its anti-join strictly to the sealed epoch:
+## How a scan goes wrong
 
-```sql
-DELETE FROM destination_subscriptions d
-WHERE d.tenant_id = 'acme'
-  AND d.is_deleted = FALSE
-  AND d.ingestion_epoch <= :sealed_epoch
-  AND NOT EXISTS (
-      SELECT 1 FROM unlogged_seen_ids s
-      WHERE s.sweep_id = :sweep_id
-        AND s.tenant_id = d.tenant_id
-        AND s.id = d.id
-  );
+OFFSET pagination is the clearest case. IDs here are 10, 20, 30 and so on, 100 per page.
+
+```text
+Page 1 (OFFSET 0, LIMIT 100) returns IDs 10 ... 1000.
+ID 420 is hard-deleted at the source.
+Every later row moves up one slot, so ID 1010 now sits at index 99.
+Page 2 (OFFSET 100) starts at ID 1020.
+
+ID 1010 was never returned. The DELETE removes it. It is still an active customer.
 ```
 
-Result: zero false deletions caused by in-flight commits.
+The other three:
 
----
+- Backdated insert. A new customer arrives mid-scan with an old `created_at`, so a `created_at < sweep_start` guard treats it as old enough to delete.
+- Uncommitted write. A writer takes a sequence number before the scan starts and commits after it. A guard of `ingestion_seq <= mark` then covers a row the scan could not have seen.
+- Replica lag. The source read replica leaves out one valid row for a single sweep.
 
-## Benchmark Results
-
-The benchmark harness tests seven configurations against 10,000 subscription records (5,000 per tenant, overlapping ID space `10..50000`, page size 100) under concurrent mutations:
+## Results
 
 <!-- BENCHMARK_TABLE_START -->
-*Benchmark metadata (Git `d7459d5`, Python `3.12.11`, PostgreSQL `16.15`, Seed `42`):*
+*Benchmark metadata (Git `0791437880`, Python `3.12.11`, PostgreSQL `16.15`, Seed `42`):*
 
-| Strategy                                   |   Ghosts |   Drift Del |   Backdated Del |   Seq Race Del |   Lag Del |   False Del | Net MRR Diff   | Gross MRR Diff   |   API Reqs | Body Bytes   | Pre-Scan DB   | Post-Scan DB   | Total DB (Med)   | Total DB (P95)   | DEL Plan (Med)   | DEL Plan Root Hits   |
-|--------------------------------------------|----------|-------------|-----------------|----------------|-----------|-------------|----------------|------------------|------------|--------------|---------------|----------------|------------------|------------------|------------------|----------------------|
-| 0. Incremental tombstone sync              |        2 |           0 |               0 |              0 |         0 |           0 | $100.00        | $100.00          |          1 | 0.8 KB       | 0.00 ms       | 2.67 ms        | 2.67 ms          | 8.53 ms          | 0.00 ms          | N/A                  |
-| 1. Naive OFFSET anti-join                  |        1 |           1 |               1 |              1 |         1 |           4 | $200.00        | $300.00          |         50 | 29.4 KB      | 0.00 ms       | 69.94 ms       | 69.94 ms         | 99.46 ms         | 59.73 ms         | 78                   |
-| 2a. Keyset with source timestamp watermark |        1 |           0 |               1 |              0 |         1 |           2 | $100.00        | $200.00          |         50 | 30.5 KB      | 3.78 ms       | 49.66 ms       | 53.73 ms         | 96.29 ms         | 9.82 ms          | 15073                |
-| 2b. Keyset with sequence watermark         |        1 |           0 |               0 |              1 |         1 |           2 | $50.00         | $150.00          |         50 | 30.5 KB      | 3.70 ms       | 49.28 ms       | 53.45 ms         | 89.53 ms         | 9.39 ms          | 15089                |
-| 2c. Transactional epoch barrier            |        1 |           0 |               0 |              0 |         1 |           1 | $0.00          | $100.00          |         50 | 30.5 KB      | 4.95 ms       | 49.04 ms       | 54.85 ms         | 88.63 ms         | 9.60 ms          | 15069                |
-| 3. Two-phase quarantine (streak >= 2)      |        1 |           0 |               0 |              0 |         0 |           0 | $50.00         | $50.00           |        100 | 61.0 KB      | 6.50 ms       | 104.32 ms      | 115.68 ms        | 156.93 ms        | 0.11 ms          | 6                    |
-| 4. Consistent snapshot pagination          |        2 |           0 |               0 |              0 |         1 |           1 | $50.00         | $150.00          |         51 | 30.5 KB      | 7.12 ms       | 50.68 ms       | 58.24 ms         | 91.91 ms         | 9.33 ms          | 15069                |
+Which scripted failure deletes a valid row?
+
+| Strategy                                   | Page drift   | Backdated insert   | Uncommitted write   | Replica lag   |
+|--------------------------------------------|--------------|--------------------|---------------------|---------------|
+| 0. Incremental tombstone sync              | ok           | ok                 | ok                  | ok            |
+| 1. Naive OFFSET anti-join                  | DELETED      | DELETED            | DELETED             | DELETED       |
+| 2a. Keyset with source timestamp watermark | ok           | DELETED            | ok                  | DELETED       |
+| 2b. Keyset with sequence watermark         | ok           | ok                 | DELETED             | DELETED       |
+| 2c. Transactional epoch barrier            | ok           | ok                 | ok                  | DELETED       |
+| 3. Two-phase quarantine (streak >= 2)      | ok           | ok                 | ok                  | ok            |
+| 4. Consistent snapshot pagination          | ok           | ok                 | ok                  | DELETED       |
+
+What each strategy leaves behind, and what it costs:
+
+| Strategy                                   |   Ghost rows left |   Valid rows deleted | Gross MRR error   |   API calls | Median DB time   |
+|--------------------------------------------|-------------------|----------------------|-------------------|-------------|------------------|
+| 0. Incremental tombstone sync              |                 2 |                    0 | $100.00           |           1 | 2.9 ms           |
+| 1. Naive OFFSET anti-join                  |                 1 |                    4 | $300.00           |          50 | 69.2 ms          |
+| 2a. Keyset with source timestamp watermark |                 1 |                    2 | $200.00           |          50 | 55.5 ms          |
+| 2b. Keyset with sequence watermark         |                 1 |                    2 | $150.00           |          50 | 54.8 ms          |
+| 2c. Transactional epoch barrier            |                 1 |                    1 | $100.00           |          50 | 56.2 ms          |
+| 3. Two-phase quarantine (streak >= 2)      |                 1 |                    0 | $50.00            |         100 | 110.7 ms         |
+| 4. Consistent snapshot pagination          |                 2 |                    1 | $150.00           |          51 | 58.4 ms          |
 <!-- BENCHMARK_TABLE_END -->
 
-### Metric Glossary
+"ok" means the scripted record survived; "DELETED" means an active customer was falsely purged. There is one record per failure, so read these as pass or fail, not as rates. Gross MRR error adds up the per-row differences, so a ghost row and a wrongly deleted row cannot cancel out. The full 17-column table is in [`BENCHMARK_TABLE.md`](BENCHMARK_TABLE.md) and individual trial timings are in [`benchmark_results.json`](benchmark_results.json).
 
-- **Drift Del:** Records falsely deleted due to OFFSET boundary shifts.
-- **Backdated Del:** Records falsely deleted due to relying on upstream creation timestamps.
-- **Seq Race Del:** Records falsely deleted due to uncommitted sequence allocation.
-- **Lag Del:** Records falsely deleted due to temporary read-replica omission.
-- **Net MRR Diff:** Aggregate error in tenant recurring revenue (`abs(dest_total - source_total)`).
-- **Gross MRR Diff:** Record-level L1 absolute revenue error summed across all IDs.
-- **Pre-Scan DB:** Median time spent acquiring per-tenant advisory locks and advancing epoch watermarks.
-- **Post-Scan DB:** Median time spent bulk-loading staged IDs, checking safety bounds, and executing the anti-join.
-- **DEL Plan Root Hits:** Root shared buffer hit count captured via `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`.
+## What the results show
 
----
+### Totals hide damage
 
-## Analysis & Engineering Takeaways
+Strategy 2c leaves one ghost row (+$50) and wrongly deletes one customer (-$50). The net MRR error is $0.00. The gross error is $100.00. A dashboard built on the total would look perfect.
 
-### 1. Net Aggregate Metrics Mask Critical Row-Level Errors
+### A sequence number is not a commit order
 
-In Strategy 2c, 1 remaining ghost row (ID 420, +$50.00 MRR) cancels out 1 false deletion caused by replica lag (ID 3000, -$50.00 MRR), producing a **$0.00 Net MRR Diff**.
+Strategy 2b reads `last_value` from a sequence before the scan and deletes rows at or below it. `nextval()` is not transactional, so a writer can hold a number below the mark and commit after the scan passed it. Strategy 2c fixes this with an epoch barrier: every write takes a `FOR SHARE` lock on its tenant's watermark row (a trigger does it in [sql/schema.sql](sql/schema.sql#L62-L80), so application code cannot forget), and the sweep starts by bumping the epoch, which waits for open writes to commit. The DELETE only touches rows from sealed epochs. [How it works](docs/DESIGN.md#the-epoch-barrier).
 
-However, the **Gross MRR Diff is $100.00**. Relying solely on dashboard totals hides silent record loss until customers report missing accounts.
+### Quarantine helps with replica lag, and proves nothing
 
-### 2. Mass-Deletion Bounds Are Mandatory Defense-in-Depth
+Strategy 3 deletes a row only after it is missing from two sweeps in a row. That clears a transient single-sweep replica omission and costs twice the API calls. A row that stays hidden for two sweeps is still deleted, and `test_two_pass_quarantine_purges_after_consecutive_omissions` shows it.
 
-Relying solely on pagination stream flags (`has_more = false`) leaves systems vulnerable to upstream API outages. If an upstream gateway returns an HTTP 200 with an empty body (`{"ids": [], "has_more": false}`), an unguarded anti-join purges the entire tenant dataset.
+### A bad scan should delete nothing
 
-The engine implements an explicit safety guard:
+The sweep aborts, and deletes nothing, on an HTTP 500 mid-scan, an empty page that claims more pages exist, a cursor that does not match the last ID, or IDs out of order. It also refuses to run if the scan returns zero IDs or would delete more than 20% of a tenant's rows (configurable with `max_delete_ratio`).
 
-```python
-if delete_ratio > max_delete_ratio:
-    raise MassDeletionAbortedError(
-        f"Sweep would delete {candidates}/{total} ({delete_ratio:.1%}) records, "
-        f"exceeding safety limit of {max_delete_ratio:.0%}."
-    )
-```
-
-### 3. Two-Phase Quarantine Handles Replica Lag
-
-When upstream APIs serve pagination queries from read replicas with replication lag, active records can be temporarily omitted during a sweep.
-
-Strategy 3 introduces an incremental state machine tracking `missing_streak`:
-- Records absent from a sweep increment `missing_streak = missing_streak + 1`.
-- Any live update or successful scan resets `missing_streak = 0`.
-- Only records missing across two consecutive completed sweeps (`missing_streak >= 2`) are purged.
-
-This eliminates false deletions from replica lag without requiring coordinated upstream cache invalidation.
-
----
-
-## Project Structure
-
-```text
-.
-├── benchmarks/
-│   └── run_benchmark.py       # Seeded 20-trial rotated benchmark harness
-├── sql/
-│   └── schema.sql             # PostgreSQL tables, indexes, triggers, and sequences
-├── src/
-│   └── pg_reconcile/
-│       ├── __init__.py        # Public module exports
-│       ├── engine.py          # Advisory locks, epoch barriers, and staging primitives
-│       ├── models.py          # Data classes and metrics structures
-│       ├── simulator.py       # Deterministic FastAPI SaaS mutation simulator
-│       └── strategies.py      # Reconciliation strategy implementations
-├── tests/
-│   ├── conftest.py            # Pytest fixtures and mock HTTP transports
-│   ├── test_concurrency.py    # Advisory locks, sequence races, and multi-tenant isolation
-│   ├── test_safety.py         # Mass-deletion bounds, lock timeouts, and network faults
-│   └── test_strategies.py     # Functional correctness tests across strategies
-├── BENCHMARK_TABLE.md         # Generated markdown table
-├── benchmark_results.json     # Complete benchmark trials and machine metadata
-└── pyproject.toml             # Python configuration and test paths
-```
-
----
-
-## Quickstart
-
-### Prerequisites
-
-- Docker with Docker Compose
-- Python 3.12+ and `uv`
-
-### Running Locally
+## Run it
 
 ```bash
-# 1. Start the PostgreSQL 16 container
-docker compose -f .devcontainer/docker-compose.yml up -d db
-
-# 2. Sync dependencies
+docker compose -f .devcontainer/docker-compose.yml up -d db   # PostgreSQL 16
 uv sync --locked
-
-# 3. Run Ruff linter
-uv run --locked ruff check .
-
-# 4. Run the test suite
-uv run --locked pytest -v
-
-# 5. Run the 20-trial seeded benchmark
-uv run --locked python benchmarks/run_benchmark.py
-
-# 6. Stop container
+uv run --locked pytest -v                                      # about 15 s
+uv run --locked python benchmarks/run_benchmark.py             # about 1 min
 docker compose -f .devcontainer/docker-compose.yml down -v
 ```
 
-> **Note:** The final command removes container volumes. Ensure `DATABASE_URL` points to a disposable local test database before running.
+In a GitHub Codespace the dev container starts the database for you, so skip the first and last lines.
+
+**`sql/schema.sql` drops and recreates its tables.** Point `DATABASE_URL` at a throwaway database only. The benchmark also rewrites the results table in this README, `benchmark_results.json` and `BENCHMARK_TABLE.md`, so expect `git status` to show changes after a run.
+
+## What this does not prove
+
+- The simulator runs in the same process as the client, through httpx's ASGI transport. There is no network and no load.
+- Each failure is one scripted record. All 20 trials run the same mutations, so they measure timing noise. Correctness never changes between trials, and the harness asserts that.
+- The timings include implementation choices (row-by-row `COPY` from Python, an `ANALYZE`, the safety-check counts), not only the algorithm. Strategy 3 runs both of its sweeps back to back, so the real delay of waiting for a second sweep is not measured. Don't read the table as a ranking of algorithms.
+- The data is 10,000 rows. Nothing here says how it behaves at a million.
+- The epoch barrier protects against writers that go through the destination table. It cannot protect against a source that lies. It also makes each sweep wait for ingestion transactions still open on that tenant, and under saturating write load that wait can get long (see Known gaps in [`docs/DESIGN.md`](docs/DESIGN.md#known-gaps)).
+
+## Layout
+
+```text
+src/pg_reconcile/             engine.py (locks, epochs, staging, guards), strategies.py, simulator.py
+sql/schema.sql                tables, trigger, indexes
+tests/                        concurrency, safety and strategy tests
+benchmarks/                   run_benchmark.py, seal_timeout_repro.py
+docs/DESIGN.md                how the sweep, the barrier, the guards, and failure modes work
+```
+
+MIT licensed.

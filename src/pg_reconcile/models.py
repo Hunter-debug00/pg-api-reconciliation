@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -16,7 +16,19 @@ class SweepExecutionStats:
     post_scan_db_ms: float
     total_db_reconcile_ms: float
     delete_query_plan_ms: float
-    delete_plan_root_shared_hits: Optional[int]
+    delete_plan_root_shared_hits: int | None
+
+
+@dataclass
+class KeysetScanResult:
+    """Validated pagination stream metrics returned by fetch_keyset_pages_fail_closed."""
+
+    seen_ids: list[int]
+    pages_fetched: int
+    api_requests: int
+    response_body_bytes: int
+    sweep_seq: int
+    init_db_ms: float
 
 
 class SubscriptionRecord(BaseModel):

@@ -5,10 +5,10 @@ and snapshot cursors, with fault injection hooks for edge cases.
 """
 
 from copy import deepcopy
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
-from fastapi import FastAPI, HTTPException, Query
+from datetime import UTC, datetime
+
 import httpx
+from fastapi import FastAPI, HTTPException, Query
 
 from pg_reconcile.models import SubscriptionRecord
 
@@ -19,24 +19,22 @@ class SourceState:
     """In-memory dataset of upstream tenant subscriptions."""
 
     def __init__(self):
-        self.records: Dict[Tuple[str, int], SubscriptionRecord] = {}
-        self.snapshots: Dict[str, List[SubscriptionRecord]] = {}
-        self.fail_on_page: Optional[int] = None
-        self.timeout_on_page: Optional[int] = None
-        self.return_truncated_page: Optional[int] = None
-        self.return_malformed_cursor_page: Optional[int] = None
-        self.return_unsorted_batch_page: Optional[int] = None
-        self.expire_snapshot_on_page: Optional[int] = None
+        self.records: dict[tuple[str, int], SubscriptionRecord] = {}
+        self.snapshots: dict[str, list[SubscriptionRecord]] = {}
+        self.fail_on_page: int | None = None
+        self.timeout_on_page: int | None = None
+        self.return_truncated_page: int | None = None
+        self.return_malformed_cursor_page: int | None = None
+        self.return_unsorted_batch_page: int | None = None
+        self.expire_snapshot_on_page: int | None = None
         self.requests_served_in_sweep: int = 0
 
-    def seed_dataset(
-        self, base_time: Optional[datetime] = None, records_per_tenant: int = 5000
-    ):
+    def seed_dataset(self, base_time: datetime | None = None, records_per_tenant: int = 5000):
         """Seed active records across tenants."""
         self.records.clear()
         self.snapshots.clear()
         self.reset_faults()
-        t0 = base_time or datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t0 = base_time or datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
         for tenant in ("acme", "globex"):
             for idx in range(1, records_per_tenant + 1):
@@ -177,9 +175,7 @@ def list_records_offset(
         (
             r
             for r in STATE.records.values()
-            if r.tenant_id == tenant_id
-            and not r.is_deleted
-            and r.transient_omit_sweeps_left == 0
+            if r.tenant_id == tenant_id and not r.is_deleted and r.transient_omit_sweeps_left == 0
         ),
         key=lambda r: r.id,
     )

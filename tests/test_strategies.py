@@ -3,7 +3,12 @@
 import httpx
 import pytest
 
-from benchmarks.run_benchmark import (
+from pg_reconcile import (
+    run_strategy_incremental,
+    run_strategy_two_pass_quarantine,
+)
+from pg_reconcile.simulator import STATE, app
+from tests.conftest import (
     BASE_TIME,
     MID_SWEEP_TIME,
     PAGE_SIZE,
@@ -12,11 +17,6 @@ from benchmarks.run_benchmark import (
     reset_environment,
     run_single_trial,
 )
-from pg_reconcile import (
-    run_strategy_incremental,
-    run_strategy_two_pass_quarantine,
-)
-from pg_reconcile.simulator import STATE, app
 
 
 @pytest.mark.asyncio

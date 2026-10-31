@@ -34,6 +34,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
+          version: "0.5.26"
           enable-cache: true
 
       - name: Set up Python 3.12
@@ -43,7 +44,9 @@ jobs:
         run: uv sync --locked
 
       - name: Lint code with Ruff
-        run: uv run --locked ruff check .
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
 
       - name: Run test suite
         env:

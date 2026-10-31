@@ -1,19 +1,19 @@
-"""PostgreSQL 16 API reconciliation primitives.
+"""Concurrency control, staging, and safety primitives for PostgreSQL API sweeps."""
 
-Handles advisory locking, epoch watermarks, unlogged table staging,
-and deletion safety bounds.
-"""
-
-from datetime import datetime
 import hashlib
 import json
 import logging
+import os
 import time
-from typing import Callable, List, Optional, Tuple
 import uuid
+from collections.abc import Callable
+from datetime import datetime
+
 import httpx
 import psycopg
 from psycopg.pq import TransactionStatus
+
+from .models import KeysetScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +30,33 @@ class MassDeletionAbortedError(IncompleteSweepError):
     """Raised when an empty or truncated scan would purge too many rows."""
 
 
+DISPOSABLE_DB_NAMES: frozenset[str] = frozenset(
+    {"reconcile_bench", "reconcile_test", "postgres_test", "test", "bench"}
+)
+
+
+def assert_disposable_database(conn: psycopg.Connection) -> None:
+    """Refuse destructive DDL unless the database is on an explicit disposable allowlist."""
+    dbname = (conn.info.dbname or "").lower()
+    allow_unsafe = os.getenv("ALLOW_UNSAFE_DB_RESET", "0") == "1"
+    if dbname not in DISPOSABLE_DB_NAMES and not allow_unsafe:
+        raise RuntimeError(
+            f"Refusing to execute destructive DDL on database '{dbname}'. "
+            f"Target database must be explicitly allowlisted in {sorted(DISPOSABLE_DB_NAMES)} "
+            "or confirmed via ALLOW_UNSAFE_DB_RESET=1."
+        )
+
+
 def tenant_advisory_lock_id(tenant_id: str) -> int:
     """Map tenant string to a stable 64-bit lock key for Postgres."""
-    digest = hashlib.sha256(f"reconcile_lock:{tenant_id}".encode("utf-8")).digest()
+    # Postgres advisory locks take a signed 64-bit int, so sha256 makes collisions extremely unlikely.
+    digest = hashlib.sha256(f"reconcile_lock:{tenant_id}".encode()).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
-def parse_explain_json(explain_row: object) -> Tuple[float, int]:
+def parse_explain_json(explain_row: object) -> tuple[float, int]:
     """Parse execution time and shared buffer hits from EXPLAIN ANALYZE JSON."""
+    # Root Plan node Shared Hit Blocks already includes child node buffers in PostgreSQL EXPLAIN output.
     data = json.loads(explain_row) if isinstance(explain_row, str) else explain_row
     top = data[0]
     exec_ms = float(top.get("Execution Time", 0.0))
@@ -47,7 +66,12 @@ def parse_explain_json(explain_row: object) -> Tuple[float, int]:
 
 
 def capture_destination_hwm_seq(conn: psycopg.Connection) -> int:
-    """Read the current sequence counter value."""
+    """Read the current sequence counter value.
+
+    Note: last_value is NOT a commit order. A concurrent writer can allocate
+    a sequence number before this call and commit after the sweep finishes.
+    Used by Strategy 2b to demonstrate uncommitted sequence races.
+    """
     with conn.cursor() as cur:
         cur.execute("SELECT last_value FROM dest_ingestion_seq")
         val = int(cur.fetchone()[0])
@@ -56,12 +80,23 @@ def capture_destination_hwm_seq(conn: psycopg.Connection) -> int:
 
 
 def seal_tenant_ingestion_epoch(
-    conn: psycopg.Connection, tenant_id: str, lock_timeout: str = "5s"
+    conn: psycopg.Connection,
+    tenant_id: str,
+    lock_timeout: str = "5s",
+    statement_timeout: str | None = None,
 ) -> int:
-    """Advance the tenant epoch watermark. Blocks until in-flight writers commit."""
+    """Advances the tenant epoch and returns the sealed boundary.
+
+    Blocks on any in-flight writers holding FOR SHARE on tenant_watermarks.
+    lock_timeout bounds individual lock acquisition waits; statement_timeout
+    bounds cumulative wait time when writers commit back-to-back under load.
+    """
+    stmt_timeout = statement_timeout or lock_timeout
     with conn.cursor() as cur:
-        cur.execute("SELECT set_config('lock_timeout', %s, true)", (lock_timeout,))
         try:
+            # Transaction-scoped timeouts reset automatically on COMMIT or ROLLBACK
+            cur.execute("SELECT set_config('lock_timeout', %s, true)", (lock_timeout,))
+            cur.execute("SELECT set_config('statement_timeout', %s, true)", (stmt_timeout,))
             cur.execute(
                 """
                 UPDATE tenant_watermarks
@@ -75,13 +110,8 @@ def seal_tenant_ingestion_epoch(
         except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
             conn.rollback()
             raise IncompleteSweepError(
-                f"Timed out acquiring epoch seal lock on tenant '{tenant_id}' behind active ingestion writers"
+                f"Timed out acquiring epoch seal lock on tenant '{tenant_id}'"
             ) from exc
-        finally:
-            try:
-                cur.execute("SET lock_timeout = DEFAULT")
-            except Exception:
-                pass
     conn.commit()
     return sealed_epoch
 
@@ -95,7 +125,7 @@ def ingest_subscription_transactional(
     source_created_at: datetime,
     updated_at: datetime,
     ingested_at: datetime,
-    preallocated_seq: Optional[int] = None,
+    preallocated_seq: int | None = None,
 ):
     """Upsert a subscription row and assign the current epoch via trigger."""
     with conn.cursor() as cur:
@@ -165,30 +195,37 @@ def acquire_tenant_sweep_lock(conn: psycopg.Connection, tenant_id: str):
             f"Active reconciliation sweep already holds lock for tenant '{tenant_id}'"
         )
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            DELETE FROM unlogged_seen_ids
-            WHERE sweep_id IN (
-                SELECT sweep_id FROM reconciliation_sweeps
-                WHERE tenant_id = %s AND status IN ('STARTED', 'STAGED')
+    try:
+        # Session advisory locks release automatically if a worker process dies,
+        # leaving its sweep row stuck in STARTED or STAGED.
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM unlogged_seen_ids
+                WHERE sweep_id IN (
+                    SELECT sweep_id FROM reconciliation_sweeps
+                    WHERE tenant_id = %s AND status IN ('STARTED', 'STAGED')
+                )
+                """,
+                (tenant_id,),
             )
-            """,
-            (tenant_id,),
-        )
-        cur.execute(
-            """
-            UPDATE reconciliation_sweeps
-            SET status = 'ABORTED'
-            WHERE tenant_id = %s AND status IN ('STARTED', 'STAGED')
-            """,
-            (tenant_id,),
-        )
-    conn.commit()
+            cur.execute(
+                """
+                UPDATE reconciliation_sweeps
+                SET status = 'ABORTED'
+                WHERE tenant_id = %s AND status IN ('STARTED', 'STAGED')
+                """,
+                (tenant_id,),
+            )
+        conn.commit()
+    except BaseException as cleanup_exc:
+        conn.rollback()
+        release_tenant_sweep_lock(conn, tenant_id, active_exc=cleanup_exc)
+        raise
 
 
 def release_tenant_sweep_lock(
-    conn: psycopg.Connection, tenant_id: str, active_exc: Optional[BaseException] = None
+    conn: psycopg.Connection, tenant_id: str, active_exc: BaseException | None = None
 ):
     """Release the session advisory lock, closing the connection if release fails."""
     lock_id = tenant_advisory_lock_id(tenant_id)
@@ -209,24 +246,21 @@ def release_tenant_sweep_lock(
         conn.commit()
 
         if not unlocked:
+            # Kill the connection so Postgres drops the session lock for us
             conn.close()
             if active_exc is None:
                 raise RuntimeError(
                     f"pg_advisory_unlock returned False for tenant '{tenant_id}'; connection closed"
                 )
     except Exception as unlock_exc:
-        logger.error(
-            "Failed to release advisory lock for tenant %s: %s", tenant_id, unlock_exc
-        )
+        logger.error("Failed to release advisory lock for tenant %s: %s", tenant_id, unlock_exc)
         if not conn.closed:
             conn.close()
         if active_exc is None:
             raise
 
 
-def abort_sweep_on_db_error(
-    conn: psycopg.Connection, sweep_id: uuid.UUID, exc: Exception
-) -> None:
+def abort_sweep_on_db_error(conn: psycopg.Connection, sweep_id: uuid.UUID, exc: Exception) -> None:
     """Mark the sweep aborted and clean up staging rows."""
     conn.rollback()
     with conn.cursor() as cur:
@@ -241,6 +275,43 @@ def abort_sweep_on_db_error(
     raise IncompleteSweepError(f"Database staging/reconcile rolled back: {exc}") from exc
 
 
+def stage_seen_ids(
+    cur: psycopg.Cursor,
+    sweep_id: uuid.UUID,
+    tenant_id: str,
+    pages_fetched: int,
+    seen_ids: list[int],
+) -> None:
+    """Stream observed IDs into UNLOGGED staging table and update sweep status to STAGED."""
+    with cur.copy("COPY unlogged_seen_ids (sweep_id, tenant_id, id) FROM STDIN") as copy:
+        for sid in seen_ids:
+            copy.write_row((sweep_id, tenant_id, sid))
+
+    cur.execute(
+        """
+        UPDATE reconciliation_sweeps
+        SET status = 'STAGED', pages_fetched = %s, records_seen = %s
+        WHERE sweep_id = %s
+        """,
+        (pages_fetched, len(seen_ids), sweep_id),
+    )
+    # Give Postgres table stats so the delete uses a good index plan
+    cur.execute("ANALYZE unlogged_seen_ids")
+
+
+def finalize_completed_sweep(cur: psycopg.Cursor, sweep_id: uuid.UUID) -> None:
+    """Mark sweep COMPLETED and purge transient unlogged staging IDs."""
+    cur.execute(
+        """
+        UPDATE reconciliation_sweeps
+        SET status = 'COMPLETED', completed_at = clock_timestamp()
+        WHERE sweep_id = %s
+        """,
+        (sweep_id,),
+    )
+    cur.execute("DELETE FROM unlogged_seen_ids WHERE sweep_id = %s", (sweep_id,))
+
+
 def assert_deletion_safety_bound(
     cur: psycopg.Cursor,
     tenant_id: str,
@@ -249,7 +320,10 @@ def assert_deletion_safety_bound(
     hwm_condition_sql: str,
     hwm_param: object,
 ):
-    """Check deletion count against safety bounds before running DELETE."""
+    """Guard against mass purging if an upstream scan returns an empty or truncated batch.
+
+    Defaults to max_delete_ratio=0.20: legitimate mass churn needs an explicit parameter bump.
+    """
     cur.execute(
         f"""
         SELECT COUNT(*) FROM destination_subscriptions d
@@ -281,9 +355,7 @@ def assert_deletion_safety_bound(
     )
     candidates_to_delete = int(cur.fetchone()[0])
 
-    cur.execute(
-        "SELECT COUNT(*) FROM unlogged_seen_ids WHERE sweep_id = %s", (sweep_id,)
-    )
+    cur.execute("SELECT COUNT(*) FROM unlogged_seen_ids WHERE sweep_id = %s", (sweep_id,))
     seen_staged = int(cur.fetchone()[0])
 
     if seen_staged == 0 and eligible_count > 0:
@@ -293,6 +365,7 @@ def assert_deletion_safety_bound(
         )
 
     delete_ratio = candidates_to_delete / eligible_count
+    # Refuse deletion if candidates exceed max_delete_ratio threshold
     if delete_ratio > max_delete_ratio:
         raise MassDeletionAbortedError(
             f"Safety guard: sweep would delete {candidates_to_delete}/{eligible_count} "
@@ -311,9 +384,9 @@ async def fetch_keyset_pages_fail_closed(
     hwm_seq: int,
     sealed_epoch: int,
     page_size: int,
-    on_page_fetched: Optional[Callable[[int], None]] = None,
-    snapshot_id: Optional[str] = None,
-) -> Tuple[List[int], int, int, int, int, float]:
+    on_page_fetched: Callable[[int], None] | None = None,
+    snapshot_id: str | None = None,
+) -> KeysetScanResult:
     """Fetch paginated records, validating order and cursor progression."""
     t_init = time.perf_counter()
     with conn.cursor() as cur:
@@ -330,7 +403,7 @@ async def fetch_keyset_pages_fail_closed(
     conn.commit()
     init_db_ms = (time.perf_counter() - t_init) * 1000.0
 
-    seen_ids: List[int] = []
+    seen_ids: list[int] = []
     after_id = 0
     page_num = 0
     api_reqs = 0
@@ -365,9 +438,9 @@ async def fetch_keyset_pages_fail_closed(
                 )
 
             data = resp.json()
-            batch: List[int] = data["ids"]
+            batch: list[int] = data["ids"]
             has_more: bool = data["has_more"]
-            next_cursor: Optional[int] = data["next_after_id"]
+            next_cursor: int | None = data["next_after_id"]
 
             if not batch and has_more:
                 raise IncompleteSweepError(
@@ -416,4 +489,11 @@ async def fetch_keyset_pages_fail_closed(
             raise
         raise IncompleteSweepError(f"Sweep aborted due to error: {exc}") from exc
 
-    return seen_ids, page_num, api_reqs, body_bytes, sweep_seq, init_db_ms
+    return KeysetScanResult(
+        seen_ids=seen_ids,
+        pages_fetched=page_num,
+        api_requests=api_reqs,
+        response_body_bytes=body_bytes,
+        sweep_seq=sweep_seq,
+        init_db_ms=init_db_ms,
+    )

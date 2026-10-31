@@ -1,27 +1,19 @@
 """Tests for advisory locking, sequence races, epoch barriers, and multi-tenant isolation."""
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+
 import httpx
 import psycopg
 import pytest
 
-from benchmarks.run_benchmark import (
-    BASE_TIME,
-    DB_URL,
-    MID_SWEEP_TIME,
-    PAGE_SIZE,
-    SWEEP_START,
-    evaluate_correctness,
-    reset_environment,
-    run_single_trial,
-)
 from pg_reconcile import (
     ConcurrentSweepError,
+    acquire_tenant_sweep_lock,
     ingest_subscription_transactional,
     release_tenant_sweep_lock,
     run_strategy_naive_offset,
@@ -31,6 +23,16 @@ from pg_reconcile import (
     tenant_advisory_lock_id,
 )
 from pg_reconcile.simulator import STATE, app
+from tests.conftest import (
+    BASE_TIME,
+    DB_URL,
+    MID_SWEEP_TIME,
+    PAGE_SIZE,
+    SWEEP_START,
+    evaluate_correctness,
+    reset_environment,
+    run_single_trial,
+)
 
 
 @pytest.mark.asyncio
@@ -241,8 +243,8 @@ async def test_multithreaded_cross_tenant_sweeps_overlap_cleanly(db_conn):
 
 
 @pytest.mark.asyncio
-async def test_randomized_mutation_stress_across_strategies(db_conn):
-    """Validate that Strategy 3 survives arbitrary combinations of transient lag and mutation bursts."""
+async def test_randomized_mutation_stress_two_pass_quarantine(db_conn):
+    """Strategy 3 handles random concurrent mutations across multiple seeds without false deletions."""
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         for seed in (101, 202, 303):
@@ -399,6 +401,141 @@ async def test_tenant_id_reassignment_rejected_by_trigger(db_conn):
                 """
                 UPDATE destination_subscriptions
                 SET tenant_id = 'globex'
+                WHERE tenant_id = 'acme' AND id = 10
+                """
+            )
+    db_conn.rollback()
+
+
+@pytest.mark.asyncio
+async def test_acquire_tenant_sweep_lock_releases_lock_on_cleanup_failure(db_conn):
+    """If abandoned sweep cleanup fails after acquiring the lock, the lock is released safely."""
+    reset_environment(db_conn)
+    lock_id = tenant_advisory_lock_id("acme")
+
+    with psycopg.connect(DB_URL) as test_conn:
+        original_cursor = test_conn.cursor
+
+        class FailingCursor:
+            def __init__(self, real_cur):
+                self.real_cur = real_cur
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return self.real_cur.__exit__(exc_type, exc_val, exc_tb)
+
+            def execute(self, query, params=None):
+                if "DELETE FROM unlogged_seen_ids" in str(query):
+                    raise psycopg.OperationalError("Simulated disk error during cleanup")
+                return self.real_cur.execute(query, params)
+
+            def fetchone(self):
+                return self.real_cur.fetchone()
+
+        def failing_cursor():
+            cur = original_cursor()
+            return FailingCursor(cur)
+
+        test_conn.cursor = failing_cursor
+
+        with pytest.raises(psycopg.OperationalError, match="Simulated disk error during cleanup"):
+            acquire_tenant_sweep_lock(test_conn, "acme")
+
+        # Verify from db_conn that the advisory lock was released
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_id,))
+            acquired = cur.fetchone()[0]
+            assert acquired is True, "Advisory lock was leaked despite cleanup failure!"
+            cur.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+
+
+@pytest.mark.asyncio
+async def test_authoritative_reingestion_resets_missing_streak_on_identical_payload(db_conn):
+    """An identical payload redelivery on a row with missing_streak > 0 resets streak and advances epoch."""
+    reset_environment(db_conn)
+    seal_tenant_ingestion_epoch(db_conn, "acme")  # epoch is now 2
+
+    # Set missing_streak = 1 for ID 3000
+    with db_conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE destination_subscriptions
+            SET missing_streak = 1, last_missed_sweep_seq = 10
+            WHERE tenant_id = 'acme' AND id = 3000
+            RETURNING mrr_cents, is_deleted, source_created_at, updated_at
+            """
+        )
+        row = cur.fetchone()
+        mrr, is_del, src_created, updated = row
+    db_conn.commit()
+
+    # Redeliver the exact same payload (no changes to business fields)
+    ingest_subscription_transactional(
+        conn=db_conn,
+        tenant_id="acme",
+        record_id=3000,
+        mrr_cents=mrr,
+        is_deleted=is_del,
+        source_created_at=src_created,
+        updated_at=updated,
+        ingested_at=MID_SWEEP_TIME,
+    )
+    db_conn.commit()
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT missing_streak, last_missed_sweep_seq, ingestion_epoch FROM destination_subscriptions WHERE tenant_id = 'acme' AND id = 3000"
+        )
+        streak, last_seq, epoch = cur.fetchone()
+        assert streak == 0, f"Expected streak 0 after redelivery, got {streak}"
+        assert last_seq == 0, f"Expected last_missed_sweep_seq 0 after redelivery, got {last_seq}"
+        assert epoch == 2, f"Expected epoch 2 after redelivery, got {epoch}"
+
+
+@pytest.mark.asyncio
+async def test_manual_update_cannot_bypass_epoch_boundary(db_conn):
+    """Direct UPDATE statements cannot reset ingestion_epoch to an earlier sealed epoch."""
+    reset_environment(db_conn)
+    seal_tenant_ingestion_epoch(db_conn, "acme")  # epoch 2
+    seal_tenant_ingestion_epoch(db_conn, "acme")  # epoch 3
+
+    with db_conn.cursor() as cur:
+        # Attempt to manually downgrade ingestion_epoch to 1 on an existing row
+        cur.execute(
+            """
+            UPDATE destination_subscriptions
+            SET ingestion_epoch = 1
+            WHERE tenant_id = 'acme' AND id = 10
+            """
+        )
+        cur.execute(
+            "SELECT ingestion_epoch FROM destination_subscriptions WHERE tenant_id = 'acme' AND id = 10"
+        )
+        epoch = cur.fetchone()[0]
+        # The trigger must overwrite the attempted downgrade with the active tenant epoch (3)
+        assert epoch == 3, f"Expected trigger to enforce epoch 3, but found {epoch}"
+    db_conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_combined_update_quarantine_bypass_rejected(db_conn):
+    """Business field mutations combined with missing_streak increments cannot bypass epoch locking."""
+    reset_environment(db_conn)
+    seal_tenant_ingestion_epoch(db_conn, "acme")  # epoch 2
+    seal_tenant_ingestion_epoch(db_conn, "acme")  # epoch 3
+
+    with db_conn.cursor() as cur:
+        # Attempt to modify a business field (mrr_cents) while incrementing missing_streak
+        # in an attempt to hit the quarantine exemption and bypass the epoch watermark.
+        with pytest.raises(psycopg.errors.RaiseException, match="Quarantine update violation"):
+            cur.execute(
+                """
+                UPDATE destination_subscriptions
+                SET mrr_cents = mrr_cents + 100,
+                    missing_streak = missing_streak + 1,
+                    ingestion_epoch = 1
                 WHERE tenant_id = 'acme' AND id = 10
                 """
             )

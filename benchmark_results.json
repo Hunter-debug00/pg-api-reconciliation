@@ -1,13 +1,13 @@
 {
   "environment": {
-    "git_commit": "d7459d53c2",
+    "git_commit": "08ef463ee5",
     "python_version": "3.12.11",
     "postgres_version": "16.15",
     "platform": "Linux-6.8.0-1064-azure-x86_64-with-glibc2.31",
     "page_size": 100,
     "trials_per_strategy": 20,
     "random_seed": 42,
-    "timestamp_utc": "2026-10-30T19:32:50.492236+00:00"
+    "timestamp_utc": "2026-10-31T17:06:20.908918+00:00"
   },
   "results": [
     {
@@ -27,12 +27,12 @@
       "api_requests": 1,
       "response_body_bytes": 809,
       "median_pre_scan_db_ms": 0.0,
-      "median_post_scan_db_ms": 2.667,
-      "median_total_db_reconcile_ms": 2.667,
-      "p95_total_db_reconcile_ms": 8.528,
+      "median_post_scan_db_ms": 2.739,
+      "median_total_db_reconcile_ms": 2.739,
+      "p95_total_db_reconcile_ms": 3.739,
       "median_delete_plan_ms": 0.0,
       "delete_plan_root_shared_hits": null,
-      "median_end_to_end_sweep_ms": 17.97
+      "median_end_to_end_sweep_ms": 18.81
     },
     {
       "strategy_name": "1. Naive OFFSET anti-join",
@@ -51,12 +51,12 @@
       "api_requests": 50,
       "response_body_bytes": 30140,
       "median_pre_scan_db_ms": 0.0,
-      "median_post_scan_db_ms": 69.944,
-      "median_total_db_reconcile_ms": 69.944,
-      "p95_total_db_reconcile_ms": 99.462,
-      "median_delete_plan_ms": 59.735,
+      "median_post_scan_db_ms": 64.269,
+      "median_total_db_reconcile_ms": 64.269,
+      "p95_total_db_reconcile_ms": 102.083,
+      "median_delete_plan_ms": 54.793,
       "delete_plan_root_shared_hits": 78,
-      "median_end_to_end_sweep_ms": 176.21
+      "median_end_to_end_sweep_ms": 159.51
     },
     {
       "strategy_name": "2a. Keyset with source timestamp watermark",
@@ -74,13 +74,13 @@
       "gross_mrr_mismatch_cents": 20000,
       "api_requests": 50,
       "response_body_bytes": 31226,
-      "median_pre_scan_db_ms": 3.782,
-      "median_post_scan_db_ms": 49.658,
-      "median_total_db_reconcile_ms": 53.733,
-      "p95_total_db_reconcile_ms": 96.286,
-      "median_delete_plan_ms": 9.825,
+      "median_pre_scan_db_ms": 3.695,
+      "median_post_scan_db_ms": 47.491,
+      "median_total_db_reconcile_ms": 51.325,
+      "p95_total_db_reconcile_ms": 60.018,
+      "median_delete_plan_ms": 10.043,
       "delete_plan_root_shared_hits": 15073,
-      "median_end_to_end_sweep_ms": 150.39
+      "median_end_to_end_sweep_ms": 135.73
     },
     {
       "strategy_name": "2b. Keyset with sequence watermark",
@@ -98,13 +98,13 @@
       "gross_mrr_mismatch_cents": 15000,
       "api_requests": 50,
       "response_body_bytes": 31226,
-      "median_pre_scan_db_ms": 3.698,
-      "median_post_scan_db_ms": 49.279,
-      "median_total_db_reconcile_ms": 53.452,
-      "p95_total_db_reconcile_ms": 89.533,
-      "median_delete_plan_ms": 9.393,
+      "median_pre_scan_db_ms": 3.691,
+      "median_post_scan_db_ms": 47.705,
+      "median_total_db_reconcile_ms": 51.412,
+      "p95_total_db_reconcile_ms": 83.462,
+      "median_delete_plan_ms": 10.864,
       "delete_plan_root_shared_hits": 15089,
-      "median_end_to_end_sweep_ms": 146.65
+      "median_end_to_end_sweep_ms": 140.23
     },
     {
       "strategy_name": "2c. Transactional epoch barrier",
@@ -122,13 +122,13 @@
       "gross_mrr_mismatch_cents": 10000,
       "api_requests": 50,
       "response_body_bytes": 31226,
-      "median_pre_scan_db_ms": 4.952,
-      "median_post_scan_db_ms": 49.044,
-      "median_total_db_reconcile_ms": 54.849,
-      "p95_total_db_reconcile_ms": 88.63,
-      "median_delete_plan_ms": 9.604,
+      "median_pre_scan_db_ms": 5.25,
+      "median_post_scan_db_ms": 47.216,
+      "median_total_db_reconcile_ms": 53.239,
+      "p95_total_db_reconcile_ms": 89.072,
+      "median_delete_plan_ms": 9.777,
       "delete_plan_root_shared_hits": 15069,
-      "median_end_to_end_sweep_ms": 148.62
+      "median_end_to_end_sweep_ms": 136.73
     },
     {
       "strategy_name": "3. Two-phase quarantine (streak >= 2)",
@@ -146,13 +146,13 @@
       "gross_mrr_mismatch_cents": 5000,
       "api_requests": 100,
       "response_body_bytes": 62460,
-      "median_pre_scan_db_ms": 6.495,
-      "median_post_scan_db_ms": 104.316,
-      "median_total_db_reconcile_ms": 115.683,
-      "p95_total_db_reconcile_ms": 156.931,
-      "median_delete_plan_ms": 0.112,
+      "median_pre_scan_db_ms": 6.785,
+      "median_post_scan_db_ms": 100.506,
+      "median_total_db_reconcile_ms": 107.292,
+      "p95_total_db_reconcile_ms": 130.026,
+      "median_delete_plan_ms": 0.09,
       "delete_plan_root_shared_hits": 6,
-      "median_end_to_end_sweep_ms": 303.1
+      "median_end_to_end_sweep_ms": 275.65
     },
     {
       "strategy_name": "4. Consistent snapshot pagination",
@@ -170,14 +170,15 @@
       "gross_mrr_mismatch_cents": 15000,
       "api_requests": 51,
       "response_body_bytes": 31259,
-      "median_pre_scan_db_ms": 7.118,
-      "median_post_scan_db_ms": 50.676,
-      "median_total_db_reconcile_ms": 58.239,
-      "p95_total_db_reconcile_ms": 91.914,
-      "median_delete_plan_ms": 9.332,
+      "median_pre_scan_db_ms": 5.674,
+      "median_post_scan_db_ms": 46.354,
+      "median_total_db_reconcile_ms": 53.913,
+      "p95_total_db_reconcile_ms": 88.902,
+      "median_delete_plan_ms": 9.747,
       "delete_plan_root_shared_hits": 15069,
-      "median_end_to_end_sweep_ms": 224.27
+      "median_end_to_end_sweep_ms": 211.41
     }
   ],
-  "markdown_table": "| Strategy                                   |   Ghosts |   Drift Del |   Backdated Del |   Seq Race Del |   Lag Del |   False Del | Net MRR Diff   | Gross MRR Diff   |   API Reqs | Body Bytes   | Pre-Scan DB   | Post-Scan DB   | Total DB (Med)   | Total DB (P95)   | DEL Plan (Med)   | DEL Plan Root Hits   |\n|--------------------------------------------|----------|-------------|-----------------|----------------|-----------|-------------|----------------|------------------|------------|--------------|---------------|----------------|------------------|------------------|------------------|----------------------|\n| 0. Incremental tombstone sync              |        2 |           0 |               0 |              0 |         0 |           0 | $100.00        | $100.00          |          1 | 0.8 KB       | 0.00 ms       | 2.67 ms        | 2.67 ms          | 8.53 ms          | 0.00 ms          | N/A                  |\n| 1. Naive OFFSET anti-join                  |        1 |           1 |               1 |              1 |         1 |           4 | $200.00        | $300.00          |         50 | 29.4 KB      | 0.00 ms       | 69.94 ms       | 69.94 ms         | 99.46 ms         | 59.73 ms         | 78                   |\n| 2a. Keyset with source timestamp watermark |        1 |           0 |               1 |              0 |         1 |           2 | $100.00        | $200.00          |         50 | 30.5 KB      | 3.78 ms       | 49.66 ms       | 53.73 ms         | 96.29 ms         | 9.82 ms          | 15073                |\n| 2b. Keyset with sequence watermark         |        1 |           0 |               0 |              1 |         1 |           2 | $50.00         | $150.00          |         50 | 30.5 KB      | 3.70 ms       | 49.28 ms       | 53.45 ms         | 89.53 ms         | 9.39 ms          | 15089                |\n| 2c. Transactional epoch barrier            |        1 |           0 |               0 |              0 |         1 |           1 | $0.00          | $100.00          |         50 | 30.5 KB      | 4.95 ms       | 49.04 ms       | 54.85 ms         | 88.63 ms         | 9.60 ms          | 15069                |\n| 3. Two-phase quarantine (streak >= 2)      |        1 |           0 |               0 |              0 |         0 |           0 | $50.00         | $50.00           |        100 | 61.0 KB      | 6.50 ms       | 104.32 ms      | 115.68 ms        | 156.93 ms        | 0.11 ms          | 6                    |\n| 4. Consistent snapshot pagination          |        2 |           0 |               0 |              0 |         1 |           1 | $50.00         | $150.00          |         51 | 30.5 KB      | 7.12 ms       | 50.68 ms       | 58.24 ms         | 91.91 ms         | 9.33 ms          | 15069                |"
+  "markdown_table": "| Strategy                                   |   Ghosts |   Drift Del |   Backdated Del |   Seq Race Del |   Lag Del |   False Del | Net MRR Diff   | Gross MRR Diff   |   API Reqs | Body Bytes   | Pre-Scan DB   | Post-Scan DB   | Total DB (Med)   | Total DB (P95)   | DEL Plan (Med)   | DEL Plan Root Hits   |\n|--------------------------------------------|----------|-------------|-----------------|----------------|-----------|-------------|----------------|------------------|------------|--------------|---------------|----------------|------------------|------------------|------------------|----------------------|\n| 0. Incremental tombstone sync              |        2 |           0 |               0 |              0 |         0 |           0 | $100.00        | $100.00          |          1 | 0.8 KB       | 0.00 ms       | 2.74 ms        | 2.74 ms          | 3.74 ms          | 0.00 ms          | N/A                  |\n| 1. Naive OFFSET anti-join                  |        1 |           1 |               1 |              1 |         1 |           4 | $200.00        | $300.00          |         50 | 29.4 KB      | 0.00 ms       | 64.27 ms       | 64.27 ms         | 102.08 ms        | 54.79 ms         | 78                   |\n| 2a. Keyset with source timestamp watermark |        1 |           0 |               1 |              0 |         1 |           2 | $100.00        | $200.00          |         50 | 30.5 KB      | 3.69 ms       | 47.49 ms       | 51.33 ms         | 60.02 ms         | 10.04 ms         | 15073                |\n| 2b. Keyset with sequence watermark         |        1 |           0 |               0 |              1 |         1 |           2 | $50.00         | $150.00          |         50 | 30.5 KB      | 3.69 ms       | 47.70 ms       | 51.41 ms         | 83.46 ms         | 10.86 ms         | 15089                |\n| 2c. Transactional epoch barrier            |        1 |           0 |               0 |              0 |         1 |           1 | $0.00          | $100.00          |         50 | 30.5 KB      | 5.25 ms       | 47.22 ms       | 53.24 ms         | 89.07 ms         | 9.78 ms          | 15069                |\n| 3. Two-phase quarantine (streak >= 2)      |        1 |           0 |               0 |              0 |         0 |           0 | $50.00         | $50.00           |        100 | 61.0 KB      | 6.79 ms       | 100.51 ms      | 107.29 ms        | 130.03 ms        | 0.09 ms          | 6                    |\n| 4. Consistent snapshot pagination          |        2 |           0 |               0 |              0 |         1 |           1 | $50.00         | $150.00          |         51 | 30.5 KB      | 5.67 ms       | 46.35 ms       | 53.91 ms         | 88.90 ms         | 9.75 ms          | 15069                |",
+  "split_markdown_tables": "#### 1. Correctness & Revenue Distortion\n\n| Strategy                                   |   Ghosts |   Drift |   Backdated |   Seq Race |   Replica Lag |   Total False Del | Net MRR Diff   | Gross MRR Diff   |\n|--------------------------------------------|----------|---------|-------------|------------|---------------|-------------------|----------------|------------------|\n| 0. Incremental tombstone sync              |        2 |       0 |           0 |          0 |             0 |                 0 | $100.00        | $100.00          |\n| 1. Naive OFFSET anti-join                  |        1 |       1 |           1 |          1 |             1 |                 4 | $200.00        | $300.00          |\n| 2a. Keyset with source timestamp watermark |        1 |       0 |           1 |          0 |             1 |                 2 | $100.00        | $200.00          |\n| 2b. Keyset with sequence watermark         |        1 |       0 |           0 |          1 |             1 |                 2 | $50.00         | $150.00          |\n| 2c. Transactional epoch barrier            |        1 |       0 |           0 |          0 |             1 |                 1 | $0.00          | $100.00          |\n| 3. Two-phase quarantine (streak >= 2)      |        1 |       0 |           0 |          0 |             0 |                 0 | $50.00         | $50.00           |\n| 4. Consistent snapshot pagination          |        2 |       0 |           0 |          0 |             1 |                 1 | $50.00         | $150.00          |\n\n#### 2. Database & API Execution Cost\n\n| Strategy                                   |   API Reqs | Payload   | Pre-Scan DB   | Post-Scan DB   | Total DB (Med)   | Total DB (P95)   | DELETE Plan   | Shared Hits   |\n|--------------------------------------------|------------|-----------|---------------|----------------|------------------|------------------|---------------|---------------|\n| 0. Incremental tombstone sync              |          1 | 0.8 KB    | 0.00 ms       | 2.74 ms        | 2.74 ms          | 3.74 ms          | 0.00 ms       | N/A           |\n| 1. Naive OFFSET anti-join                  |         50 | 29.4 KB   | 0.00 ms       | 64.27 ms       | 64.27 ms         | 102.08 ms        | 54.79 ms      | 78            |\n| 2a. Keyset with source timestamp watermark |         50 | 30.5 KB   | 3.69 ms       | 47.49 ms       | 51.33 ms         | 60.02 ms         | 10.04 ms      | 15,073        |\n| 2b. Keyset with sequence watermark         |         50 | 30.5 KB   | 3.69 ms       | 47.70 ms       | 51.41 ms         | 83.46 ms         | 10.86 ms      | 15,089        |\n| 2c. Transactional epoch barrier            |         50 | 30.5 KB   | 5.25 ms       | 47.22 ms       | 53.24 ms         | 89.07 ms         | 9.78 ms       | 15,069        |\n| 3. Two-phase quarantine (streak >= 2)      |        100 | 61.0 KB   | 6.79 ms       | 100.51 ms      | 107.29 ms        | 130.03 ms        | 0.09 ms       | 6             |\n| 4. Consistent snapshot pagination          |         51 | 30.5 KB   | 5.67 ms       | 46.35 ms       | 53.91 ms         | 88.90 ms         | 9.75 ms       | 15,069        |"
 }

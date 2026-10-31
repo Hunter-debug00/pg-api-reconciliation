@@ -3,7 +3,7 @@
   "dockerComposeFile": "docker-compose.yml",
   "service": "app",
   "workspaceFolder": "/workspaces/pg-api-reconciliation",
-  "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && ~/.local/bin/uv sync --locked",
+  "postCreateCommand": "curl -LsSf https://astral.sh/uv/0.5.26/install.sh | sh && ~/.local/bin/uv sync --locked",
   "customizations": {
     "vscode": {
       "extensions": [

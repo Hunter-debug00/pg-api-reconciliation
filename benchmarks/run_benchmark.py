@@ -6,18 +6,18 @@ concurrent mutations.
 """
 
 import asyncio
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
 import platform
 import random
 import statistics
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 import httpx
 import psycopg
 from tabulate import tabulate
@@ -30,12 +30,13 @@ if str(ROOT_DIR / "src") not in sys.path:
 
 from pg_reconcile import (  # noqa: E402
     SweepExecutionStats,
+    assert_disposable_database,
     ingest_subscription_transactional,
-    run_strategy_0_incremental,
-    run_strategy_1_naive_offset,
-    run_strategy_2_staged_keyset,
-    run_strategy_3_two_pass_quarantine,
-    run_strategy_4_snapshot_cursor,
+    run_strategy_incremental,
+    run_strategy_naive_offset,
+    run_strategy_snapshot_cursor,
+    run_strategy_staged_keyset,
+    run_strategy_two_pass_quarantine,
 )
 from pg_reconcile.simulator import STATE, app  # noqa: E402
 
@@ -48,7 +49,7 @@ PAGE_SIZE = 100
 TRIALS = int(os.getenv("BENCHMARK_TRIALS", "20"))
 RANDOM_SEED = 42
 
-BASE_TIME = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+BASE_TIME = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 SWEEP_START = BASE_TIME + timedelta(seconds=2)
 MID_SWEEP_TIME = BASE_TIME + timedelta(seconds=15)
 BACKDATED_SOURCE_TIME = BASE_TIME - timedelta(minutes=30)
@@ -76,14 +77,15 @@ class StrategyResultSummary:
     median_total_db_reconcile_ms: float
     p95_total_db_reconcile_ms: float
     median_delete_plan_ms: float
-    delete_plan_root_shared_hits: Optional[int]
+    delete_plan_root_shared_hits: int | None
     median_end_to_end_sweep_ms: float
 
 
 def reset_environment(conn: psycopg.Connection) -> int:
     """Recreate tables and seed initial active subscriptions."""
+    assert_disposable_database(conn)
     conn.rollback()
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
         schema_sql = f.read()
 
     with conn.cursor() as cur:
@@ -93,6 +95,7 @@ def reset_environment(conn: psycopg.Connection) -> int:
     STATE.set_transient_omission(tenant_id="acme", record_id=3000, sweeps=1)
 
     with conn.cursor() as cur:
+        # Disable trigger during initial bulk seed; re-enabled before any sweep or mutation runs.
         cur.execute(
             "ALTER TABLE destination_subscriptions DISABLE TRIGGER trg_enforce_tenant_epoch"
         )
@@ -121,9 +124,7 @@ def reset_environment(conn: psycopg.Connection) -> int:
                         0,
                     )
                 )
-        cur.execute(
-            "ALTER TABLE destination_subscriptions ENABLE TRIGGER trg_enforce_tenant_epoch"
-        )
+        cur.execute("ALTER TABLE destination_subscriptions ENABLE TRIGGER trg_enforce_tenant_epoch")
         cur.execute("SELECT setval('dest_ingestion_seq', %s)", (seq,))
         cur.execute("SELECT nextval('dest_ingestion_seq')")
         preallocated_seq = int(cur.fetchone()[0])
@@ -131,9 +132,7 @@ def reset_environment(conn: psycopg.Connection) -> int:
     return preallocated_seq
 
 
-def trigger_deterministic_mutations(
-    page_num: int, conn: psycopg.Connection, preallocated_seq: int
-):
+def trigger_deterministic_mutations(page_num: int, conn: psycopg.Connection, preallocated_seq: int):
     """Inject concurrent mutations during sweep pagination of tenant acme."""
     if page_num == 1:
         STATE.hard_delete("acme", 420)
@@ -209,17 +208,13 @@ def sync_soft_delete_tombstone(conn: psycopg.Connection):
     conn.commit()
 
 
-def evaluate_correctness(conn: psycopg.Connection) -> Dict[str, int]:
+def evaluate_correctness(conn: psycopg.Connection) -> dict[str, int]:
     """Compare destination tables against upstream ground truth."""
     source_acme = {
-        r.id: r
-        for r in STATE.records.values()
-        if r.tenant_id == "acme" and not r.is_deleted
+        r.id: r for r in STATE.records.values() if r.tenant_id == "acme" and not r.is_deleted
     }
     source_globex = {
-        r.id: r
-        for r in STATE.records.values()
-        if r.tenant_id == "globex" and not r.is_deleted
+        r.id: r for r in STATE.records.values() if r.tenant_id == "globex" and not r.is_deleted
     }
 
     with conn.cursor() as cur:
@@ -257,10 +252,7 @@ def evaluate_correctness(conn: psycopg.Connection) -> Dict[str, int]:
 
     all_acme_ids = source_acme_ids | dest_acme_ids
     gross_mrr_mismatch = sum(
-        abs(
-            (source_acme[rid].mrr_cents if rid in source_acme else 0)
-            - dest_acme.get(rid, 0)
-        )
+        abs((source_acme[rid].mrr_cents if rid in source_acme else 0) - dest_acme.get(rid, 0))
         for rid in all_acme_ids
     )
 
@@ -280,7 +272,7 @@ def evaluate_correctness(conn: psycopg.Connection) -> Dict[str, int]:
 
 async def run_single_trial(
     strategy_key: str, conn: psycopg.Connection
-) -> tuple[SweepExecutionStats, Dict[str, int], float]:
+) -> tuple[SweepExecutionStats, dict[str, int], float]:
     preallocated_seq = reset_environment(conn)
     transport = httpx.ASGITransport(app=app)
     t_start = time.perf_counter()
@@ -289,13 +281,13 @@ async def run_single_trial(
         if strategy_key == "s0_incremental":
             trigger_deterministic_mutations(1, conn, preallocated_seq)
             trigger_deterministic_mutations(2, conn, preallocated_seq)
-            stats = await run_strategy_0_incremental(
+            stats = await run_strategy_incremental(
                 client, conn, "acme", BASE_TIME, MID_SWEEP_TIME, page_size=PAGE_SIZE
             )
 
         elif strategy_key == "s1_naive_offset":
             sync_soft_delete_tombstone(conn)
-            stats = await run_strategy_1_naive_offset(
+            stats = await run_strategy_naive_offset(
                 client,
                 conn,
                 "acme",
@@ -308,7 +300,7 @@ async def run_single_trial(
 
         elif strategy_key == "s2a_keyset_source_created_hwm":
             sync_soft_delete_tombstone(conn)
-            stats = await run_strategy_2_staged_keyset(
+            stats = await run_strategy_staged_keyset(
                 client,
                 conn,
                 "acme",
@@ -322,7 +314,7 @@ async def run_single_trial(
 
         elif strategy_key == "s2b_keyset_non_tx_seq_hwm":
             sync_soft_delete_tombstone(conn)
-            stats = await run_strategy_2_staged_keyset(
+            stats = await run_strategy_staged_keyset(
                 client,
                 conn,
                 "acme",
@@ -336,7 +328,7 @@ async def run_single_trial(
 
         elif strategy_key == "s2c_keyset_sealed_epoch_hwm":
             sync_soft_delete_tombstone(conn)
-            stats = await run_strategy_2_staged_keyset(
+            stats = await run_strategy_staged_keyset(
                 client,
                 conn,
                 "acme",
@@ -350,7 +342,7 @@ async def run_single_trial(
 
         elif strategy_key == "s3_two_pass_quarantine":
             sync_soft_delete_tombstone(conn)
-            stats = await run_strategy_3_two_pass_quarantine(
+            stats = await run_strategy_two_pass_quarantine(
                 client,
                 conn,
                 "acme",
@@ -364,7 +356,7 @@ async def run_single_trial(
 
         elif strategy_key == "s4_snapshot_cursor":
             sync_soft_delete_tombstone(conn)
-            stats = await run_strategy_4_snapshot_cursor(
+            stats = await run_strategy_snapshot_cursor(
                 client,
                 conn,
                 "acme",
@@ -382,7 +374,7 @@ async def run_single_trial(
     return stats, correctness, elapsed_ms
 
 
-def _p95(values: List[float]) -> float:
+def _p95(values: list[float]) -> float:
     if len(values) < 2:
         return values[0]
     sorted_vals = sorted(values)
@@ -392,7 +384,7 @@ def _p95(values: List[float]) -> float:
 
 async def benchmark_all(
     conn: psycopg.Connection, trials: int = TRIALS
-) -> List[StrategyResultSummary]:
+) -> list[StrategyResultSummary]:
     strategies = [
         ("s0_incremental", "0. Incremental tombstone sync"),
         ("s1_naive_offset", "1. Naive OFFSET anti-join"),
@@ -407,20 +399,20 @@ async def benchmark_all(
         await run_single_trial(key, conn)
 
     rng = random.Random(RANDOM_SEED)
-    schedule: List[str] = []
+    schedule: list[str] = []
     for _ in range(trials):
         keys = [k for k, _ in strategies]
         rng.shuffle(keys)
         schedule.extend(keys)
 
-    collected_pre_db: Dict[str, List[float]] = {k: [] for k, _ in strategies}
-    collected_post_db: Dict[str, List[float]] = {k: [] for k, _ in strategies}
-    collected_db_times: Dict[str, List[float]] = {k: [] for k, _ in strategies}
-    collected_plan_times: Dict[str, List[float]] = {k: [] for k, _ in strategies}
-    collected_sweep_times: Dict[str, List[float]] = {k: [] for k, _ in strategies}
-    collected_buffers: Dict[str, List[int]] = {k: [] for k, _ in strategies}
-    collected_corrs: Dict[str, List[Dict[str, int]]] = {k: [] for k, _ in strategies}
-    last_stats_map: Dict[str, SweepExecutionStats] = {}
+    collected_pre_db: dict[str, list[float]] = {k: [] for k, _ in strategies}
+    collected_post_db: dict[str, list[float]] = {k: [] for k, _ in strategies}
+    collected_db_times: dict[str, list[float]] = {k: [] for k, _ in strategies}
+    collected_plan_times: dict[str, list[float]] = {k: [] for k, _ in strategies}
+    collected_sweep_times: dict[str, list[float]] = {k: [] for k, _ in strategies}
+    collected_buffers: dict[str, list[int]] = {k: [] for k, _ in strategies}
+    collected_corrs: dict[str, list[dict[str, int]]] = {k: [] for k, _ in strategies}
+    last_stats_map: dict[str, SweepExecutionStats] = {}
 
     for key in schedule:
         stats, corr, elapsed = await run_single_trial(key, conn)
@@ -434,7 +426,7 @@ async def benchmark_all(
         collected_corrs[key].append(corr)
         last_stats_map[key] = stats
 
-    summaries: List[StrategyResultSummary] = []
+    summaries: list[StrategyResultSummary] = []
     for key, label in strategies:
         first_corr = collected_corrs[key][0]
         assert all(
@@ -459,9 +451,7 @@ async def benchmark_all(
                 false_deletions_mid_sweep_backdated=first_corr[
                     "false_deletions_mid_sweep_backdated"
                 ],
-                false_deletions_uncommitted_seq=first_corr[
-                    "false_deletions_uncommitted_seq"
-                ],
+                false_deletions_uncommitted_seq=first_corr["false_deletions_uncommitted_seq"],
                 false_deletions_transient_lag=first_corr["false_deletions_transient_lag"],
                 total_false_deletions=first_corr["total_false_deletions"],
                 globex_rows_wiped=first_corr["globex_rows_wiped"],
@@ -471,21 +461,26 @@ async def benchmark_all(
                 response_body_bytes=last_stats.response_body_bytes,
                 median_pre_scan_db_ms=round(statistics.median(collected_pre_db[key]), 3),
                 median_post_scan_db_ms=round(statistics.median(collected_post_db[key]), 3),
-                median_total_db_reconcile_ms=round(
-                    statistics.median(collected_db_times[key]), 3
-                ),
+                median_total_db_reconcile_ms=round(statistics.median(collected_db_times[key]), 3),
                 p95_total_db_reconcile_ms=round(_p95(collected_db_times[key]), 3),
-                median_delete_plan_ms=round(
-                    statistics.median(collected_plan_times[key]), 3
-                ),
+                median_delete_plan_ms=round(statistics.median(collected_plan_times[key]), 3),
                 delete_plan_root_shared_hits=med_buffers,
-                median_end_to_end_sweep_ms=round(
-                    statistics.median(collected_sweep_times[key]), 2
-                ),
+                median_end_to_end_sweep_ms=round(statistics.median(collected_sweep_times[key]), 2),
             )
         )
 
-    return summaries
+    raw_trials: dict[str, dict] = {}
+    for key, label in strategies:
+        raw_trials[label] = {
+            "pre_scan_db_ms": collected_pre_db[key],
+            "post_scan_db_ms": collected_post_db[key],
+            "total_db_reconcile_ms": collected_db_times[key],
+            "delete_query_plan_ms": collected_plan_times[key],
+            "delete_plan_shared_hits": collected_buffers[key],
+            "end_to_end_sweep_ms": collected_sweep_times[key],
+        }
+
+    return summaries, raw_trials
 
 
 def get_environment_metadata(conn: psycopg.Connection) -> dict:
@@ -493,9 +488,7 @@ def get_environment_metadata(conn: psycopg.Connection) -> dict:
         cur.execute("SHOW server_version")
         pg_version = cur.fetchone()[0]
     try:
-        git_sha = (
-            subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()[:10]
-        )
+        git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()[:10]
     except Exception:
         git_sha = "unknown"
 
@@ -507,8 +500,130 @@ def get_environment_metadata(conn: psycopg.Connection) -> dict:
         "page_size": PAGE_SIZE,
         "trials_per_strategy": TRIALS,
         "random_seed": RANDOM_SEED,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
     }
+
+
+def format_benchmark_tables(summaries: list[StrategyResultSummary]) -> str:
+    """Formats benchmark results into two focused tables (Correctness vs. Cost) to avoid horizontal scroll."""
+    correctness_rows = []
+    performance_rows = []
+
+    for s in summaries:
+        correctness_rows.append(
+            [
+                s.strategy_name,
+                s.hard_delete_ghosts_remaining,
+                s.false_deletions_boundary_shift,
+                s.false_deletions_mid_sweep_backdated,
+                s.false_deletions_uncommitted_seq,
+                s.false_deletions_transient_lag,
+                s.total_false_deletions,
+                f"${s.net_mrr_distortion_cents / 100:,.2f}",
+                f"${s.gross_mrr_mismatch_cents / 100:,.2f}",
+            ]
+        )
+
+        buf_str = (
+            f"{s.delete_plan_root_shared_hits:,}"
+            if s.delete_plan_root_shared_hits is not None
+            else "N/A"
+        )
+        performance_rows.append(
+            [
+                s.strategy_name,
+                s.api_requests,
+                f"{s.response_body_bytes / 1024:.1f} KB",
+                f"{s.median_pre_scan_db_ms:.2f} ms",
+                f"{s.median_post_scan_db_ms:.2f} ms",
+                f"{s.median_total_db_reconcile_ms:.2f} ms",
+                f"{s.p95_total_db_reconcile_ms:.2f} ms",
+                f"{s.median_delete_plan_ms:.2f} ms",
+                buf_str,
+            ]
+        )
+
+    corr_headers = [
+        "Strategy",
+        "Ghosts",
+        "Drift",
+        "Backdated",
+        "Seq Race",
+        "Replica Lag",
+        "Total False Del",
+        "Net MRR Diff",
+        "Gross MRR Diff",
+    ]
+    perf_headers = [
+        "Strategy",
+        "API Reqs",
+        "Payload",
+        "Pre-Scan DB",
+        "Post-Scan DB",
+        "Total DB (Med)",
+        "Total DB (P95)",
+        "DELETE Plan",
+        "Shared Hits",
+    ]
+
+    t1 = tabulate(correctness_rows, headers=corr_headers, tablefmt="github")
+    t2 = tabulate(performance_rows, headers=perf_headers, tablefmt="github")
+
+    return (
+        "#### 1. Correctness & Revenue Distortion\n\n"
+        f"{t1}\n\n"
+        "#### 2. Database & API Execution Cost\n\n"
+        f"{t2}"
+    )
+
+
+def build_readme_tables(summaries: list[StrategyResultSummary]) -> str:
+    """Two compact tables for the README. The full 17-column table stays in BENCHMARK_TABLE.md."""
+    verdict = lambda n: "DELETED" if n else "ok"  # noqa: E731
+    matrix = [
+        [
+            s.strategy_name,
+            verdict(s.false_deletions_boundary_shift),
+            verdict(s.false_deletions_mid_sweep_backdated),
+            verdict(s.false_deletions_uncommitted_seq),
+            verdict(s.false_deletions_transient_lag),
+        ]
+        for s in summaries
+    ]
+    numbers = [
+        [
+            s.strategy_name,
+            s.hard_delete_ghosts_remaining,
+            s.total_false_deletions,
+            f"${s.gross_mrr_mismatch_cents / 100:,.2f}",
+            s.api_requests,
+            f"{s.median_total_db_reconcile_ms:.1f} ms",
+        ]
+        for s in summaries
+    ]
+    matrix_md = tabulate(
+        matrix,
+        headers=["Strategy", "Page drift", "Backdated insert", "Uncommitted write", "Replica lag"],
+        tablefmt="github",
+    )
+    numbers_md = tabulate(
+        numbers,
+        headers=[
+            "Strategy",
+            "Ghost rows left",
+            "Valid rows deleted",
+            "Gross MRR error",
+            "API calls",
+            "Median DB time",
+        ],
+        tablefmt="github",
+    )
+    return (
+        "Which scripted failure deletes a valid row?\n\n"
+        f"{matrix_md}\n\n"
+        "What each strategy leaves behind, and what it costs:\n\n"
+        f"{numbers_md}"
+    )
 
 
 def update_readme_table(md_table: str, env_meta: dict):
@@ -524,7 +639,7 @@ def update_readme_table(md_table: str, env_meta: dict):
 
     readme_path = ROOT_DIR / "README.md"
     if readme_path.exists():
-        with open(readme_path, "r", encoding="utf-8") as f:
+        with open(readme_path, encoding="utf-8") as f:
             content = f.read()
 
         if marker_start in content and marker_end in content:
@@ -539,11 +654,11 @@ async def main():
     print()
     print(
         f"Running reconciliation benchmark across 10,000 subscription records "
-        f"({TRIALS} randomized trials per strategy, page_size={PAGE_SIZE})..."
+        f"({TRIALS} repeated timing trials with a seeded, rotated strategy execution order, page_size={PAGE_SIZE})..."
     )
     with psycopg.connect(DB_URL) as conn:
         env_meta = get_environment_metadata(conn)
-        summaries = await benchmark_all(conn, trials=TRIALS)
+        summaries, raw_trials = await benchmark_all(conn, trials=TRIALS)
 
     table_rows = []
     for s in summaries:
@@ -595,13 +710,16 @@ async def main():
     ]
 
     md_table = tabulate(table_rows, headers=headers, tablefmt="github")
+    split_tables = format_benchmark_tables(summaries)
     print("\n=== REPRODUCIBLE BENCHMARK RESULTS ===")
-    print(md_table)
+    print(split_tables)
 
     payload = {
         "environment": env_meta,
         "results": [asdict(s) for s in summaries],
+        "raw_trial_observations": raw_trials,
         "markdown_table": md_table,
+        "split_markdown_tables": split_tables,
     }
 
     results_path = ROOT_DIR / "benchmark_results.json"
@@ -610,9 +728,15 @@ async def main():
 
     table_path = ROOT_DIR / "BENCHMARK_TABLE.md"
     with open(table_path, "w", encoding="utf-8") as f:
-        f.write(md_table + "\n")
+        f.write(
+            "# Reproducible Benchmark Results\n\n"
+            f"{split_tables}\n\n"
+            "---\n\n"
+            "### Consolidated 17-Column Metric View\n\n"
+            f"{md_table}\n"
+        )
 
-    update_readme_table(md_table, env_meta)
+    update_readme_table(build_readme_tables(summaries), env_meta)
     print("\nSynchronized benchmark_results.json, BENCHMARK_TABLE.md, and README.md")
 
 

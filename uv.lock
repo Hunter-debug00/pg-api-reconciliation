@@ -129,10 +129,14 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "tabulate" },
+]
+
+[package.dev-dependencies]
+dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
-    { name = "tabulate" },
 ]
 
 [package.metadata]
@@ -140,10 +144,14 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.0" },
+    { name = "tabulate", specifier = ">=0.9.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
     { name = "pytest", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "ruff", specifier = ">=0.7.0" },
-    { name = "tabulate", specifier = ">=0.9.0" },
 ]
 
 [[package]]
