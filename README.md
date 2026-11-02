@@ -49,7 +49,7 @@ The other three:
 ## Results
 
 <!-- BENCHMARK_TABLE_START -->
-*Benchmark metadata (Git `0791437880`, Python `3.12.11`, PostgreSQL `16.15`, Seed `42`):*
+*Benchmark metadata (Git `253fd33436`, Python `3.12.11`, PostgreSQL `16.15`, Seed `42`):*
 
 Which scripted failure deletes a valid row?
 
@@ -67,13 +67,13 @@ What each strategy leaves behind, and what it costs:
 
 | Strategy                                   |   Ghost rows left |   Valid rows deleted | Gross MRR error   |   API calls | Median DB time   |
 |--------------------------------------------|-------------------|----------------------|-------------------|-------------|------------------|
-| 0. Incremental tombstone sync              |                 2 |                    0 | $100.00           |           1 | 2.9 ms           |
-| 1. Naive OFFSET anti-join                  |                 1 |                    4 | $300.00           |          50 | 69.2 ms          |
-| 2a. Keyset with source timestamp watermark |                 1 |                    2 | $200.00           |          50 | 55.5 ms          |
-| 2b. Keyset with sequence watermark         |                 1 |                    2 | $150.00           |          50 | 54.8 ms          |
-| 2c. Transactional epoch barrier            |                 1 |                    1 | $100.00           |          50 | 56.2 ms          |
-| 3. Two-phase quarantine (streak >= 2)      |                 1 |                    0 | $50.00            |         100 | 110.7 ms         |
-| 4. Consistent snapshot pagination          |                 2 |                    1 | $150.00           |          51 | 58.4 ms          |
+| 0. Incremental tombstone sync              |                 2 |                    0 | $100.00           |           1 | 2.8 ms           |
+| 1. Naive OFFSET anti-join                  |                 1 |                    4 | $300.00           |          50 | 73.5 ms          |
+| 2a. Keyset with source timestamp watermark |                 1 |                    2 | $200.00           |          50 | 57.0 ms          |
+| 2b. Keyset with sequence watermark         |                 1 |                    2 | $150.00           |          50 | 57.9 ms          |
+| 2c. Transactional epoch barrier            |                 1 |                    1 | $100.00           |          50 | 57.7 ms          |
+| 3. Two-phase quarantine (streak >= 2)      |                 1 |                    0 | $50.00            |         100 | 113.3 ms         |
+| 4. Consistent snapshot pagination          |                 2 |                    1 | $150.00           |          51 | 56.4 ms          |
 <!-- BENCHMARK_TABLE_END -->
 
 "ok" means the scripted record survived; "DELETED" means an active customer was falsely purged. There is one record per failure, so read these as pass or fail, not as rates. Gross MRR error adds up the per-row differences, so a ghost row and a wrongly deleted row cannot cancel out. The full 17-column table is in [`BENCHMARK_TABLE.md`](BENCHMARK_TABLE.md) and individual trial timings are in [`benchmark_results.json`](benchmark_results.json).
